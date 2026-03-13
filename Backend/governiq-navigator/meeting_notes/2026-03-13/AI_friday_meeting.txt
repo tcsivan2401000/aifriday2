@@ -1,0 +1,19 @@
+Governance Steering Committee - 2026-03-13
+
+Attendees: Maria Garcia, James Wilson, Sarah Chen (CFO), Raj Patel (CTO), Linda Park (CHRO)
+
+- Maria Garcia: Renewable Energy Transition (INIT-SUS-1) at 45% completion. Solar panel installation in 3 EU facilities on track. Wind power vendor contract for APAC facilities pending legal review.
+- James Wilson: AI Ready Workforce Program (INIT-PEO-1) at 30% completion. Pilot AI literacy training completed for 120 employees. Positive feedback but need to scale to remaining 800 staff.
+- Sarah Chen: Q1 sustainability budget utilization at 62%. Recommends accelerating renewable energy spend before fiscal year-end. Carbon credit costs rising 15% YoY.
+- Raj Patel: AI tools evaluation complete — selected 3 platforms for workforce training. Integration with existing LMS blocked by SSO configuration.
+- Linda Park: Gender balance declined to 47% globally. Urgent need to review hiring pipeline. AI Ready program should include diversity lens.
+- DECISION: Approve additional $2M for solar installations in North America.
+- DECISION: Extend AI literacy training deadline to September to ensure quality.
+- BLOCKER: Wind power vendor contract stuck in legal for 3 weeks. Escalate to General Counsel.
+- BLOCKER: LMS integration for AI training blocked by SSO — IT team to prioritize.
+- ACTION: Maria to finalize North America solar vendor shortlist by March 20.
+- ACTION: James to present scaled AI training plan to leadership by March 25.
+- ACTION: Linda to propose gender balance improvement plan with hiring targets by April 1.
+- ACTION: Raj to resolve LMS/SSO blocker with IT by March 17.
+- RISK: If wind power contracts delayed beyond April, Q2 sustainability targets will be missed.
+- RISK: Without LMS integration, AI training cannot scale beyond pilot group.

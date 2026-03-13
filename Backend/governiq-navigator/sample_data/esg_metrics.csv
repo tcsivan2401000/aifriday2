@@ -1,0 +1,19 @@
+date,org_unit,metric_name,value,unit
+2025-10-01,TCS Mexico,Electricity Usage,185000,kWh
+2025-11-01,TCS Mexico,Electricity Usage,180000,kWh
+2025-12-01,TCS Mexico,Electricity Usage,176000,kWh
+2026-01-01,TCS Mexico,Electricity Usage,172000,kWh
+2026-02-01,TCS Mexico,Electricity Usage,178000,kWh
+2026-03-01,TCS Mexico,Electricity Usage,182000,kWh
+2025-10-01,TCS Mexico,CO2 Emissions,92,tonnes
+2025-11-01,TCS Mexico,CO2 Emissions,89,tonnes
+2025-12-01,TCS Mexico,CO2 Emissions,87,tonnes
+2026-01-01,TCS Mexico,CO2 Emissions,85,tonnes
+2026-02-01,TCS Mexico,CO2 Emissions,88,tonnes
+2026-03-01,TCS Mexico,CO2 Emissions,91,tonnes
+2025-10-01,TCS Mexico,Water Use,4200,m³
+2025-11-01,TCS Mexico,Water Use,4100,m³
+2025-12-01,TCS Mexico,Water Use,4000,m³
+2026-01-01,TCS Mexico,Water Use,3900,m³
+2026-02-01,TCS Mexico,Water Use,3850,m³
+2026-03-01,TCS Mexico,Water Use,3800,m³

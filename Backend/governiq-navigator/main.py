@@ -1,0 +1,1233 @@
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Path, Query
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import IntegrityError
+from models import Base, Metric, Initiative, Note, Brief
+from db import engine, SessionLocal
+from ingest import ingest_metrics_csv, ingest_initiatives_csv, ingest_notes
+from brief import generate_weekly_brief
+from pydantic import BaseModel
+from typing import Optional, List
+import asyncio
+import datetime
+import pandas as pd
+import os
+import re
+import glob
+
+# Import agentic features
+from agent import (
+    generate_ai_brief,
+    chat_query,
+    analyze_initiative,
+    detect_and_explain_anomalies,
+    generate_dashboard_intelligence,
+)
+from vector_store import add_meeting_notes, add_brief_to_store
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title="Sustainability + DEI Governance Insights Agent",
+    description="Agentic AI-powered governance insights with RAG and multi-step reasoning",
+    version="2.0.0"
+)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]) 
+
+
+# Pydantic models for API
+class LatestResponse(BaseModel):
+    last_brief_generated: Optional[datetime.datetime]
+
+class ChatRequest(BaseModel):
+    question: str
+
+class ChatResponse(BaseModel):
+    success: bool
+    response: str
+    tool_calls: list = []
+    iterations: int = 0
+    error: Optional[str] = None
+
+class StatsResponse(BaseModel):
+    esg_metrics: int
+    dei_metrics: int
+    initiatives: int
+    overdue_count: int
+
+
+class DashboardIntelligenceResponse(BaseModel):
+    success: bool
+    mode: str
+    as_of_date: str
+    risks: list[str]
+    insights: list[str]
+    recommendations: list[str]
+    tool_calls: list = []
+    iterations: int = 0
+    error: Optional[str] = None
+
+
+# ============ DATA INGESTION ENDPOINTS ============
+
+@app.post('/esg', tags=["Data Ingestion"])
+async def upload_esg(file: UploadFile = File(...)):
+    """Upload ESG metrics CSV file"""
+    try:
+        count = ingest_metrics_csv(file, 'esg')
+        return {"status":"ok","ingested_rows":count}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post('/dei', tags=["Data Ingestion"])
+async def upload_dei(file: UploadFile = File(...)):
+    """Upload DEI metrics CSV file"""
+    try:
+        count = ingest_metrics_csv(file, 'dei')
+        return {"status":"ok","ingested_rows":count}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post('/initiatives', tags=["Data Ingestion"])
+async def upload_initiatives(file: UploadFile = File(...)):
+    """Upload initiatives CSV file"""
+    try:
+        count = ingest_initiatives_csv(file)
+        return {"status":"ok","ingested_rows":count}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post('/notes', tags=["Data Ingestion"])
+async def upload_notes(text: str = Form(...), source: str = Form('meeting_notes.txt')):
+    """Upload meeting notes text (also indexed for RAG)"""
+    try:
+        note_id = ingest_notes(text, source)
+        # Also add to vector store for RAG
+        try:
+            add_meeting_notes(text, source, note_id)
+        except Exception:
+            pass  # Vector store is optional
+        return {"status":"ok", "note_id": note_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ============ FILE-BASED MEETING NOTES ============
+
+MEETING_NOTES_DIR = os.path.join(os.path.dirname(__file__), "meeting_notes")
+
+
+@app.post('/notes/file-upload', tags=["Meeting Notes"])
+async def upload_notes_to_folder(
+    text: str = Form(...),
+    date: str = Form(...),
+    title: str = Form("meeting_notes"),
+):
+    """Save meeting notes text to meeting_notes/{date}/ folder."""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    # Sanitize title for filename
+    safe_title = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "_")[:80]
+    if not safe_title:
+        safe_title = "meeting_notes"
+    folder = os.path.join(MEETING_NOTES_DIR, date)
+    os.makedirs(folder, exist_ok=True)
+    filepath = os.path.join(folder, f"{safe_title}.txt")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(text)
+    # Also ingest into DB + vector store for RAG
+    try:
+        note_id = ingest_notes(text, safe_title)
+        try:
+            add_meeting_notes(text, safe_title, note_id)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return {"status": "ok", "date": date, "file": f"{safe_title}.txt"}
+
+
+@app.get('/notes/dates', tags=["Meeting Notes"])
+async def list_note_dates():
+    """List all dates that have meeting notes folders."""
+    if not os.path.isdir(MEETING_NOTES_DIR):
+        return {"dates": []}
+    dates = sorted(
+        [d for d in os.listdir(MEETING_NOTES_DIR)
+         if os.path.isdir(os.path.join(MEETING_NOTES_DIR, d)) and re.match(r"^\d{4}-\d{2}-\d{2}$", d)],
+        reverse=True,
+    )
+    return {"dates": dates}
+
+
+@app.get('/notes/by-date/{date}', tags=["Meeting Notes"])
+async def get_notes_by_date(date: str):
+    """List meeting note files for a given date."""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    folder = os.path.join(MEETING_NOTES_DIR, date)
+    if not os.path.isdir(folder):
+        return {"date": date, "notes": []}
+    notes = []
+    for fname in sorted(os.listdir(folder)):
+        if not fname.endswith(".txt"):
+            continue
+        filepath = os.path.join(folder, fname)
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+        title = fname.replace(".txt", "").replace("_", " ")
+        notes.append({
+            "filename": fname,
+            "title": title,
+            "preview": content[:200],
+            "content": content,
+        })
+    return {"date": date, "notes": notes}
+
+
+@app.post('/notes/summarize-file', tags=["Meeting Notes"])
+async def summarize_file_note(date: str = Form(...), filename: str = Form(...)):
+    """Summarize a meeting note file from the meeting_notes folder."""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    safe_filename = os.path.basename(filename)
+    filepath = os.path.join(MEETING_NOTES_DIR, date, safe_filename)
+    if not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail="Meeting note file not found")
+    with open(filepath, "r", encoding="utf-8") as f:
+        notes_text = f.read()
+
+    # Include initiatives context
+    db = SessionLocal()
+    try:
+        initiatives = db.query(Initiative).all()
+        init_context = ""
+        if initiatives:
+            today = datetime.date.today()
+            init_lines = []
+            for i in initiatives:
+                overdue = (
+                    i.due_date and i.due_date < today
+                    and (i.status or "").lower() not in ["done", "completed", "closed"]
+                )
+                marker = " ** OVERDUE **" if overdue else ""
+                init_lines.append(
+                    f"  [{i.id}] {i.name} | Owner: {i.owner} | Pillar: {i.pillar} "
+                    f"| Status: {i.status} | Due: {i.due_date}{marker}"
+                )
+            init_context = "\n\nACTIVE INITIATIVES:\n" + "\n".join(init_lines)
+    finally:
+        db.close()
+
+    prompt = (
+        "You are GovernIQ, an AI governance assistant. Summarize the following meeting notes "
+        "into EXACTLY 5 concise, executive-ready bullet points.\n\n"
+        "Rules:\n"
+        "- Return EXACTLY 5 bullet points, no more, no less.\n"
+        "- Each bullet should be 1-2 sentences maximum.\n"
+        "- Focus on key decisions, action items, risks, blockers, and important updates.\n"
+        "- Reference specific people, initiative IDs, and dates where relevant.\n"
+        "- Start each bullet with a bold category tag like **Decision:**, **Action:**, **Risk:**, **Blocker:**, **Update:**\n\n"
+        f"MEETING NOTES:\n{notes_text}"
+        f"{init_context}"
+    )
+
+    try:
+        from agent import get_client
+        from config import OPENAI_MODEL
+        openai_client = get_client()
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are GovernIQ, an executive governance summarization assistant. Always produce exactly 5 bullet points."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        summary = response.choices[0].message.content
+        return {"success": True, "summary": summary}
+    except Exception as e:
+        lines = notes_text.split("\n")
+        key_lines = [
+            l.strip() for l in lines
+            if any(kw in l.lower() for kw in ["action", "decision", "blocker", "risk", "update"])
+        ]
+        if len(key_lines) < 5:
+            key_lines += [l.strip() for l in lines if l.strip() and l.strip() not in key_lines][:5 - len(key_lines)]
+        fallback = "\n".join(f"• {a}" for a in key_lines[:5])
+        return {"success": True, "summary": fallback, "error": str(e)}
+
+
+# ============ BRIEF GENERATION ENDPOINTS ============
+
+@app.post('/generate', tags=["Brief Generation"])
+async def generate(week_start: str, use_ai: bool = False):
+    """
+    Generate weekly executive brief.
+    
+    - use_ai=False: Deterministic rule-based brief (default)
+    - use_ai=True: AI-powered brief using GPT-4o with multi-step reasoning
+    """
+    try:
+        dt = datetime.datetime.fromisoformat(week_start)
+    except Exception:
+        raise HTTPException(status_code=400, detail='week_start must be YYYY-MM-DD')
+    
+    if use_ai:
+        # AI-powered brief generation
+        result = await asyncio.to_thread(generate_ai_brief, dt.date())
+        if result["success"]:
+            # Store brief in DB
+            db = SessionLocal()
+            try:
+                b = Brief(week_start=dt.date(), content_md=result["response"])
+                db.add(b)
+                db.commit()
+                # Also add to vector store
+                try:
+                    add_brief_to_store(result["response"], dt.date().isoformat(), b.id)
+                except:
+                    pass
+            finally:
+                db.close()
+        return JSONResponse(content={
+            "status": "ok" if result["success"] else "error",
+            "brief": result["response"],
+            "tool_calls": result.get("tool_calls", []),
+            "iterations": result.get("iterations", 0),
+            "mode": "ai"
+        })
+    else:
+        # Deterministic brief
+        brief = generate_weekly_brief(dt.date())
+        return JSONResponse(content={"status":"ok","brief":brief, "mode": "deterministic"})
+
+
+# ============ AGENTIC AI ENDPOINTS ============
+
+@app.post('/chat', tags=["Agentic AI"], response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Chat with the AI agent about governance data.
+    
+    Examples:
+    - "Why is INIT-2 at risk?"
+    - "What are our top ESG concerns this week?"
+    - "Show me DEI trends for Europe"
+    - "Who owns the most overdue initiatives?"
+    """
+    data_summary = _get_data_summary()
+    result = await asyncio.to_thread(chat_query, request.question, data_context=data_summary)
+    return ChatResponse(
+        success=result["success"],
+        response=result["response"],
+        tool_calls=result.get("tool_calls", []),
+        iterations=result.get("iterations", 0),
+        error=result.get("error")
+    )
+
+@app.get('/analyze/initiative/{initiative_id}', tags=["Agentic AI"])
+async def analyze_init(initiative_id: str):
+    """
+    Deep dive analysis on a specific initiative.
+    
+    Returns AI-generated analysis with:
+    - Current status and progress
+    - Risk assessment
+    - Related metrics
+    - Context from meeting notes
+    - Recommended actions
+    """
+    result = await asyncio.to_thread(analyze_initiative, initiative_id)
+    return JSONResponse(content=result)
+
+@app.get('/analyze/anomalies', tags=["Agentic AI"])
+async def analyze_anomalies():
+    """
+    Detect and explain anomalies in metrics data.
+    
+    Uses AI to:
+    - Identify unusual patterns
+    - Provide explanations
+    - Search for context
+    - Suggest follow-up actions
+    """
+    result = await asyncio.to_thread(detect_and_explain_anomalies)
+    return JSONResponse(content=result)
+
+
+def _deterministic_dashboard_intelligence(as_of_date: datetime.date) -> dict:
+    """Fallback intelligence when AI is unavailable."""
+    db = SessionLocal()
+    try:
+        recent_cutoff = as_of_date - datetime.timedelta(days=30)
+
+        recent_metrics = db.query(Metric).filter(Metric.date >= recent_cutoff).all()
+        all_inits = db.query(Initiative).all()
+
+        risks = []
+        insights = []
+        recommendations = []
+
+        # Risks from initiatives
+        overdue_items = []
+        for i in all_inits:
+            if i.due_date and i.due_date < as_of_date and (i.status or "").lower() not in ["done", "completed", "closed"]:
+                overdue_items.append(i)
+
+        at_risk_items = [i for i in all_inits if (i.status or "").lower() == "at risk"]
+
+        for item in overdue_items[:3]:
+            risks.append(
+                f"Overdue initiative: {item.id} {item.name} (owner: {item.owner}, due: {item.due_date}) (source: initiative {item.id})"
+            )
+        for item in at_risk_items[:2]:
+            risks.append(
+                f"At-risk initiative: {item.id} {item.name} (owner: {item.owner}) (source: initiative {item.id})"
+            )
+
+        # Insights from metrics
+        esg = [m for m in recent_metrics if m.source == 'esg']
+        dei = [m for m in recent_metrics if m.source == 'dei']
+
+        if esg:
+            latest_esg = sorted(esg, key=lambda x: x.date, reverse=True)[:1]
+            if latest_esg:
+                m = latest_esg[0]
+                insights.append(
+                    f"Latest sustainability signal: {m.metric_name} in {m.org_unit} is {m.value} {m.unit} on {m.date} (source: metrics id {m.id})"
+                )
+
+        if dei:
+            latest_dei = sorted(dei, key=lambda x: x.date, reverse=True)[:1]
+            if latest_dei:
+                m = latest_dei[0]
+                insights.append(
+                    f"Latest people signal: {m.metric_name} in {m.org_unit} is {m.value} {m.unit} on {m.date} (source: metrics id {m.id})"
+                )
+
+        if all_inits:
+            insights.append(
+                f"Initiatives tracked: {len(all_inits)} total, {len(overdue_items)} overdue, {len(at_risk_items)} at risk (source: initiatives)"
+            )
+
+        # Recommendations
+        recommendations.append(
+            "Run weekly risk review for overdue or at-risk initiatives with named owners and next checkpoint dates."
+        )
+        recommendations.append(
+            "Prioritize one sustainability and one people initiative for executive follow-up in this week demo narrative."
+        )
+        recommendations.append(
+            "Validate data freshness for ESG and DEI metrics every 7 days to avoid blind spots in dashboard intelligence."
+        )
+
+        return {
+            "success": True,
+            "mode": "deterministic",
+            "as_of_date": as_of_date.isoformat(),
+            "risks": risks[:5],
+            "insights": insights[:5],
+            "recommendations": recommendations[:5],
+            "tool_calls": [],
+            "iterations": 0,
+            "error": None,
+        }
+    finally:
+        db.close()
+
+
+@app.get('/intelligence/dashboard', tags=["Agentic AI"], response_model=DashboardIntelligenceResponse)
+async def dashboard_intelligence(
+    as_of_date: str = Query(None, description="Date in YYYY-MM-DD format"),
+    use_ai: bool = Query(True, description="Use AI model call for intelligence generation"),
+):
+    """
+    Generate intelligence payload for dashboard with 3 sections:
+    - risks
+    - insights
+    - recommendations
+    """
+    try:
+        dt = datetime.date.fromisoformat(as_of_date) if as_of_date else datetime.date.today()
+    except Exception:
+        raise HTTPException(status_code=400, detail='as_of_date must be YYYY-MM-DD')
+
+    if use_ai:
+        ai_result = await asyncio.to_thread(generate_dashboard_intelligence, dt)
+        if ai_result.get("success"):
+            intelligence = ai_result.get("intelligence", {})
+            return DashboardIntelligenceResponse(
+                success=True,
+                mode="ai",
+                as_of_date=dt.isoformat(),
+                risks=intelligence.get("risks", []),
+                insights=intelligence.get("insights", []),
+                recommendations=intelligence.get("recommendations", []),
+                tool_calls=ai_result.get("tool_calls", []),
+                iterations=ai_result.get("iterations", 0),
+                error=None,
+            )
+
+        fallback = _deterministic_dashboard_intelligence(dt)
+        fallback["mode"] = "deterministic_fallback"
+        fallback["error"] = ai_result.get("error", "AI intelligence generation failed")
+        return DashboardIntelligenceResponse(**fallback)
+
+    deterministic = _deterministic_dashboard_intelligence(dt)
+    return DashboardIntelligenceResponse(**deterministic)
+
+
+# ============ DEDICATED INTELLIGENCE ENDPOINTS ============
+
+class IntelligenceRequest(BaseModel):
+    pillar: str = "all"
+
+
+def _get_data_summary() -> str:
+    """Fetch a summary of all uploaded data for intelligence generation."""
+    db = SessionLocal()
+    try:
+        esg_metrics = db.query(Metric).filter(Metric.source == 'esg').order_by(Metric.date.desc()).limit(50).all()
+        dei_metrics = db.query(Metric).filter(Metric.source == 'dei').order_by(Metric.date.desc()).limit(50).all()
+        initiatives = db.query(Initiative).all()
+        notes = db.query(Note).limit(10).all()
+
+        parts = []
+
+        if esg_metrics:
+            parts.append("=== ESG / SUSTAINABILITY METRICS (most recent) ===")
+            for m in esg_metrics:
+                parts.append(f"  [id:{m.id}] {m.date} | {m.org_unit} | {m.metric_name}: {m.value} {m.unit}")
+        else:
+            parts.append("=== ESG METRICS === No ESG data uploaded yet.")
+
+        if dei_metrics:
+            parts.append("\n=== DEI / PEOPLE METRICS (most recent) ===")
+            for m in dei_metrics:
+                parts.append(f"  [id:{m.id}] {m.date} | {m.org_unit} | {m.metric_name}: {m.value} {m.unit}")
+        else:
+            parts.append("\n=== DEI METRICS === No DEI data uploaded yet.")
+
+        if initiatives:
+            parts.append("\n=== INITIATIVES ===")
+            today = datetime.date.today()
+            for i in initiatives:
+                is_overdue = (
+                    i.due_date
+                    and i.due_date < today
+                    and (i.status or "").lower() not in ["done", "completed", "closed"]
+                )
+                marker = " ** OVERDUE **" if is_overdue else ""
+                parts.append(
+                    f"  [{i.id}] {i.name} | Owner: {i.owner} | Pillar: {i.pillar} "
+                    f"| Status: {i.status} | Due: {i.due_date}{marker}"
+                )
+        else:
+            parts.append("\n=== INITIATIVES === No initiatives uploaded yet.")
+
+        if notes:
+            parts.append("\n=== MEETING NOTES (latest) ===")
+            for n in notes:
+                preview = (n.content or "")[:300]
+                parts.append(f"  [source: {n.source}] {preview}")
+
+        return "\n".join(parts)
+    finally:
+        db.close()
+
+
+_INTELLIGENCE_SYSTEM = (
+    "You are GovernIQ, an AI-powered governance intelligence engine for a large corporation. "
+    "You analyze sustainability (ESG), people (DEI), and initiative data to provide actionable intelligence for leadership. "
+    "Be concise, specific, and always reference actual data values and initiative IDs when available. "
+    "If no data has been uploaded yet, say so clearly and suggest uploading data first."
+)
+
+_INTELLIGENCE_PROMPTS = {
+    "risks": (
+        "Analyze the following governance data and identify exactly 4 RISKS that leadership should be aware of.\n\n"
+        "DATA:\n{data}\n\n"
+        "Focus on:\n"
+        "- ESG metrics with negative trends or concerning values (e.g. rising emissions, declining renewable energy)\n"
+        "- DEI metrics that show gaps or concerning patterns (e.g. low representation, declining engagement)\n"
+        "- Initiatives that are OVERDUE or AT RISK\n"
+        "- Data gaps or missing reporting periods\n\n"
+        "For each risk provide: a clear risk statement, severity (High/Medium/Low), "
+        "supporting data evidence with specific values and IDs, and what could happen if unaddressed.\n"
+        "Return EXACTLY 4 bullet points using • as the bullet character. Be direct and actionable."
+    ),
+    "insights": (
+        "Analyze the following governance data and generate 3-5 KEY INSIGHTS that reveal patterns, connections, and trends.\n\n"
+        "DATA:\n{data}\n\n"
+        "Focus on:\n"
+        "- How ESG metrics relate to sustainability initiatives\n"
+        "- How DEI metrics connect to people/HR initiatives\n"
+        "- Cross-pillar patterns (e.g. sustainability efforts impacting team engagement)\n"
+        "- Trends over time — what is improving, what is declining\n"
+        "- Connections between different metrics and initiatives\n\n"
+        "For each insight provide: a clear insight statement, supporting evidence with specific data values, "
+        "and the 'so what' — why this matters for leadership.\n"
+        "Format as numbered items. Be specific."
+    ),
+    "recommendations": (
+        "Based on the following governance data, provide 3-5 PRIORITIZED RECOMMENDATIONS for leadership action.\n\n"
+        "DATA:\n{data}\n\n"
+        "Focus on:\n"
+        "- Which initiatives need immediate attention and why\n"
+        "- Actions to accelerate positive trends or mitigate identified risks\n"
+        "- Resource allocation priorities\n"
+        "- Quick wins vs. strategic long-term moves\n\n"
+        "For each recommendation provide: a clear action statement, priority (Urgent/High/Medium), "
+        "expected impact, suggested owner, and timeline.\n"
+        "Format as numbered items. Be actionable and specific."
+    ),
+}
+
+
+def _call_intelligence(prompt_type: str, data_summary: str) -> dict:
+    """Make a direct GPT call for intelligence generation with pre-fetched data."""
+    import httpx
+    from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+
+    user_prompt = _INTELLIGENCE_PROMPTS.get(prompt_type, _INTELLIGENCE_PROMPTS["risks"]).format(data=data_summary)
+
+    try:
+        from agent import get_client
+        openai_client = get_client()
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": _INTELLIGENCE_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+        )
+        return {"success": True, "response": response.choices[0].message.content}
+    except Exception as e:
+        return {"success": False, "response": f"AI analysis unavailable: {e}", "error": str(e)}
+
+
+def _deterministic_intelligence(prompt_type: str) -> str:
+    """Fallback plain-text intelligence when AI is unavailable."""
+    det = _deterministic_dashboard_intelligence(datetime.date.today())
+    mapping = {
+        "risks": det.get("risks", []),
+        "insights": det.get("insights", []),
+        "recommendations": det.get("recommendations", []),
+    }
+    items = mapping.get(prompt_type, [])
+    if not items:
+        return "No data available yet. Please upload ESG, DEI, or Initiatives data first."
+    return "\n".join(f"• {item}" for item in items)
+
+
+@app.post('/intelligence/risks', tags=["Intelligence"])
+async def intelligence_risks(request: IntelligenceRequest = IntelligenceRequest()):
+    """Analyze uploaded data and return risk intelligence."""
+    data_summary = _get_data_summary()
+    result = _call_intelligence("risks", data_summary)
+    response_text = result["response"] if result["success"] else _deterministic_intelligence("risks")
+    return {"success": True, "risks": response_text, "raw_response": response_text}
+
+
+@app.post('/intelligence/insights', tags=["Intelligence"])
+async def intelligence_insights(request: IntelligenceRequest = IntelligenceRequest()):
+    """Analyze uploaded data and return insight intelligence."""
+    data_summary = _get_data_summary()
+    result = _call_intelligence("insights", data_summary)
+    response_text = result["response"] if result["success"] else _deterministic_intelligence("insights")
+    return {"success": True, "insights": response_text, "raw_response": response_text}
+
+
+@app.post('/intelligence/recommendations', tags=["Intelligence"])
+async def intelligence_recommendations(request: IntelligenceRequest = IntelligenceRequest()):
+    """Analyze uploaded data and return recommendation intelligence."""
+    data_summary = _get_data_summary()
+    result = _call_intelligence("recommendations", data_summary)
+    response_text = result["response"] if result["success"] else _deterministic_intelligence("recommendations")
+    return {"success": True, "recommendations": response_text, "raw_response": response_text}
+
+
+# ============ MEETING NOTES LISTING ============
+
+def _extract_meeting_title(content: str) -> str:
+    """Extract meeting title from the first non-empty line of note content."""
+    for line in (content or "").split("\n"):
+        stripped = line.strip()
+        if stripped:
+            return stripped[:120]
+    return "Untitled Meeting"
+
+
+def _extract_meeting_description(content: str) -> str:
+    """Extract a short description from meeting note content — key topics, attendees, etc."""
+    lines = (content or "").split("\n")
+    parts = []
+    attendees = ""
+    topics = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if "attendees" in lower or "participants" in lower:
+            attendees = stripped
+        elif any(tag in lower for tag in ["decision", "action", "blocker", "risk"]):
+            topics.append(stripped.lstrip("- ").split(":")[0].strip())
+        elif stripped.startswith("- ") and ":" in stripped:
+            speaker = stripped.lstrip("- ").split(":")[0].strip()
+            if speaker and speaker not in topics:
+                topics.append(speaker)
+    if attendees:
+        parts.append(attendees[:100])
+    if topics:
+        parts.append("Topics: " + ", ".join(dict.fromkeys(topics))[:120])
+    return " | ".join(parts) if parts else "Meeting notes"
+
+
+@app.get('/notes/list', tags=["Meeting Notes"])
+async def list_notes(date: str = Query(None, description="Filter by date YYYY-MM-DD")):
+    """
+    List available meeting notes, optionally filtered by date.
+    Returns id, date, title (first line), and source for each note.
+    """
+    db = SessionLocal()
+    try:
+        query = db.query(Note).order_by(Note.created_at.desc())
+        notes = query.all()
+
+        results = []
+        seen_dates = set()
+        for n in notes:
+            note_date = n.created_at.strftime("%Y-%m-%d") if n.created_at else None
+            if date and note_date != date:
+                continue
+            seen_dates.add(note_date)
+            results.append({
+                "id": n.id,
+                "date": note_date,
+                "title": _extract_meeting_title(n.content),
+                "description": _extract_meeting_description(n.content),
+                "source": n.source,
+            })
+
+        # Also return distinct available dates for date-picker
+        all_dates = sorted(
+            {n.created_at.strftime("%Y-%m-%d") for n in db.query(Note).all() if n.created_at},
+            reverse=True,
+        )
+
+        return {"notes": results, "available_dates": all_dates}
+    finally:
+        db.close()
+
+
+# ============ MEETING SUMMARIZE ENDPOINT ============
+
+class SummarizeRequest(BaseModel):
+    note_id: Optional[int] = None
+    text: Optional[str] = None
+
+
+@app.post('/summarize', tags=["Intelligence"])
+async def summarize_meetings(request: SummarizeRequest = SummarizeRequest()):
+    """
+    Summarize a single meeting note into exactly 5 executive bullet points.
+    Accepts note_id (DB id) or raw text.
+    """
+    # Gather the meeting note
+    if request.note_id:
+        db = SessionLocal()
+        try:
+            note = db.query(Note).filter(Note.id == request.note_id).first()
+            if not note:
+                raise HTTPException(status_code=404, detail="Meeting note not found")
+            notes_text = note.content
+        finally:
+            db.close()
+    elif request.text and request.text.strip():
+        notes_text = request.text.strip()
+    else:
+        db = SessionLocal()
+        try:
+            notes = db.query(Note).order_by(Note.id.desc()).limit(20).all()
+            if not notes:
+                return {
+                    "success": True,
+                    "summary": "No meeting notes found. Please upload meeting notes first via the Data Ingestion page.",
+                }
+            notes_text = "\n\n".join(
+                f"[Source: {n.source}]\n{n.content}" for n in notes
+            )
+        finally:
+            db.close()
+
+    # Also include initiatives context for cross-referencing
+    db = SessionLocal()
+    try:
+        initiatives = db.query(Initiative).all()
+        init_context = ""
+        if initiatives:
+            init_lines = []
+            today = datetime.date.today()
+            for i in initiatives:
+                overdue = (
+                    i.due_date
+                    and i.due_date < today
+                    and (i.status or "").lower() not in ["done", "completed", "closed"]
+                )
+                marker = " ** OVERDUE **" if overdue else ""
+                init_lines.append(
+                    f"  [{i.id}] {i.name} | Owner: {i.owner} | Pillar: {i.pillar} "
+                    f"| Status: {i.status} | Due: {i.due_date}{marker}"
+                )
+            init_context = "\n\nACTIVE INITIATIVES:\n" + "\n".join(init_lines)
+    finally:
+        db.close()
+
+    prompt = (
+        "You are GovernIQ, an AI governance assistant. Summarize the following meeting notes "
+        "into EXACTLY 5 concise, executive-ready bullet points.\n\n"
+        "Rules:\n"
+        "- Return EXACTLY 5 bullet points, no more, no less.\n"
+        "- Each bullet should be 1-2 sentences maximum.\n"
+        "- Focus on key decisions, action items, risks, blockers, and important updates.\n"
+        "- Reference specific people, initiative IDs, and dates where relevant.\n"
+        "- Start each bullet with a bold category tag like **Decision:**, **Action:**, **Risk:**, **Blocker:**, **Update:**\n\n"
+        f"MEETING NOTES:\n{notes_text}"
+        f"{init_context}"
+    )
+
+    try:
+        from agent import get_client
+        from config import OPENAI_MODEL
+        openai_client = get_client()
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are GovernIQ, an executive governance summarization assistant. Always produce exactly 5 bullet points."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        summary = response.choices[0].message.content
+        return {"success": True, "summary": summary}
+    except Exception as e:
+        # Deterministic fallback — extract 5 key lines
+        lines = notes_text.split("\n")
+        key_lines = [
+            l.strip() for l in lines
+            if any(kw in l.lower() for kw in ["action", "decision", "blocker", "risk", "update"])
+        ]
+        if len(key_lines) < 5:
+            key_lines += [l.strip() for l in lines if l.strip() and l.strip() not in key_lines][:5 - len(key_lines)]
+        fallback = "\n".join(f"• {a}" for a in key_lines[:5])
+        return {"success": True, "summary": fallback, "error": str(e)}
+
+
+@app.post('/demo/seed-initiatives', tags=["Data Ingestion"])
+async def seed_demo_initiatives():
+    """
+    Seed two demo initiatives:
+    - One sustainability initiative
+    - One people initiative
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.datetime.utcnow()
+        records = [
+            Initiative(
+                id="INIT-SUS-1",
+                name="Renewable Energy Transition",
+                owner="Maria Garcia",
+                pillar="Sustainability",
+                status="In Progress",
+                due_date=datetime.date(2026, 6, 30),
+                last_update=now,
+                raw_row="demo_seed",
+            ),
+            Initiative(
+                id="INIT-PEO-1",
+                name="AI Ready Workforce Program",
+                owner="James Wilson",
+                pillar="People",
+                status="In Progress",
+                due_date=datetime.date(2026, 9, 15),
+                last_update=now,
+                raw_row="demo_seed",
+            ),
+        ]
+
+        for record in records:
+            db.merge(record)
+
+        db.commit()
+        return {
+            "status": "ok",
+            "seeded": [r.id for r in records],
+            "message": "Demo initiatives ready: 1 sustainability and 1 people"
+        }
+    finally:
+        db.close()
+
+
+@app.post('/demo/seed-notes', tags=["Data Ingestion"])
+async def seed_demo_notes():
+    """
+    Seed two demo meeting notes for the same date so the summarize page
+    shows 2 meetings to choose from.
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.datetime(2026, 3, 10, 9, 0, 0)
+        note1 = Note(
+            source="Governance Steering Committee",
+            content=(
+                "Governance Steering Committee - 2026-03-10\n\n"
+                "Attendees: Maria Garcia, James Wilson, Sarah Chen (CFO), Raj Patel (CTO), Linda Park (CHRO)\n\n"
+                "- Maria Garcia: Renewable Energy Transition (INIT-SUS-1) at 45% completion. Solar panel installation in 3 EU facilities on track. "
+                "Wind power vendor contract for APAC facilities pending legal review.\n"
+                "- James Wilson: AI Ready Workforce Program (INIT-PEO-1) at 30% completion. Pilot AI literacy training completed for 120 employees. "
+                "Positive feedback but need to scale to remaining 800 staff.\n"
+                "- Sarah Chen: Q1 sustainability budget utilization at 62%. Recommends accelerating renewable energy spend before fiscal year-end. "
+                "Carbon credit costs rising 15% YoY.\n"
+                "- Raj Patel: AI tools evaluation complete — selected 3 platforms for workforce training. Integration with existing LMS blocked by SSO configuration.\n"
+                "- Linda Park: Gender balance declined to 47% globally. Urgent need to review hiring pipeline.\n"
+                "- DECISION: Approve additional $2M for solar installations in North America.\n"
+                "- DECISION: Extend AI literacy training deadline to September to ensure quality.\n"
+                "- BLOCKER: Wind power vendor contract stuck in legal for 3 weeks. Escalate to General Counsel.\n"
+                "- BLOCKER: LMS integration for AI training blocked by SSO — IT team to prioritize.\n"
+                "- ACTION: Maria to finalize North America solar vendor shortlist by March 20.\n"
+                "- ACTION: James to present scaled AI training plan to leadership by March 25.\n"
+                "- ACTION: Linda to propose gender balance improvement plan with hiring targets by April 1.\n"
+                "- RISK: If wind power contracts delayed beyond April, Q2 sustainability targets will be missed.\n"
+                "- RISK: Without LMS integration, AI training cannot scale beyond pilot group."
+            ),
+            created_at=now,
+        )
+        note2 = Note(
+            source="Weekly Operations Sync",
+            content=(
+                "Weekly Operations Sync - 2026-03-10\n\n"
+                "Attendees: Maria Garcia, James Wilson, Anil Kumar (Ops Lead), Priya Sharma (Data Team)\n\n"
+                "- Anil Kumar: Facility energy audits completed for 5 of 12 sites. Results show 22% energy waste in APAC offices. "
+                "Recommends immediate HVAC optimization.\n"
+                "- Maria Garcia: Solar vendor RFPs received from 4 companies. Cost range $1.2M-$1.8M per facility. "
+                "Need CFO approval to proceed with top 2 vendors.\n"
+                "- James Wilson: AI training pilot survey results — 89% satisfaction rate. Main gap: hands-on labs needed. "
+                "Requesting budget for cloud sandbox environments.\n"
+                "- Priya Sharma: ESG data pipeline automated — daily ingestion from 8 regional systems now live. "
+                "DEI dashboard refresh scheduled for next sprint.\n"
+                "- DECISION: Prioritize APAC HVAC optimization — ROI within 6 months.\n"
+                "- DECISION: Allocate $50K for AI training cloud sandbox environments.\n"
+                "- ACTION: Anil to deliver full energy audit report by March 18.\n"
+                "- ACTION: Maria to schedule vendor demos for March 22-23.\n"
+                "- ACTION: Priya to add carbon intensity metric to ESG dashboard by March 20.\n"
+                "- BLOCKER: Regional DEI data from Latin America still missing — HR team unresponsive.\n"
+                "- RISK: Energy audit delays could push HVAC optimization to Q3, missing sustainability targets."
+            ),
+            created_at=now,
+        )
+        db.add(note1)
+        db.add(note2)
+        db.commit()
+        return {
+            "status": "ok",
+            "seeded": 2,
+            "message": "2 demo meeting notes seeded for 2026-03-10"
+        }
+    finally:
+        db.close()
+
+
+# ============ DATA RESET ENDPOINT ============
+
+@app.delete('/data/reset', tags=["Data Management"])
+async def reset_all_data():
+    """
+    Clear ALL uploaded data: metrics, initiatives, notes, briefs,
+    meeting_notes folders, and the vector store.
+    """
+    db = SessionLocal()
+    try:
+        del_metrics = db.query(Metric).delete()
+        del_inits = db.query(Initiative).delete()
+        del_notes = db.query(Note).delete()
+        del_briefs = db.query(Brief).delete()
+        db.commit()
+    finally:
+        db.close()
+
+    # Clear meeting_notes folders
+    import shutil
+    if os.path.isdir(MEETING_NOTES_DIR):
+        shutil.rmtree(MEETING_NOTES_DIR)
+    os.makedirs(MEETING_NOTES_DIR, exist_ok=True)
+
+    # Clear vector store
+    try:
+        from vector_store import get_chroma_client
+        client = get_chroma_client()
+        for col_name in [c.name for c in client.list_collections()]:
+            client.delete_collection(col_name)
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "deleted": {
+            "metrics": del_metrics,
+            "initiatives": del_inits,
+            "notes": del_notes,
+            "briefs": del_briefs,
+        },
+        "message": "All data cleared. You can now upload fresh data."
+    }
+
+
+# ============ INITIATIVES LIST ENDPOINT ============
+
+@app.get('/initiatives/list', tags=["Initiatives"])
+async def list_initiatives():
+    """Return all initiatives from the database with is_overdue flag."""
+    db = SessionLocal()
+    try:
+        inits = db.query(Initiative).all()
+        today = datetime.date.today()
+        results = []
+        for i in inits:
+            is_overdue = (
+                i.due_date is not None
+                and i.due_date < today
+                and (i.status or "").lower() not in ["done", "completed", "closed"]
+            )
+            results.append({
+                "id": i.id,
+                "name": i.name,
+                "owner": i.owner,
+                "pillar": i.pillar,
+                "status": i.status,
+                "due_date": i.due_date.isoformat() if i.due_date else None,
+                "last_update": i.last_update.isoformat() if i.last_update else None,
+                "is_overdue": is_overdue,
+            })
+        return {"initiatives": results}
+    finally:
+        db.close()
+
+
+# ============ METRICS ENDPOINT ============
+
+@app.get('/metrics/{metric_type}', tags=["Metrics"])
+async def get_metrics(metric_type: str = Path(..., regex="^(dei|esg)$")):
+    """
+    Get metrics data from the database. metric_type can be 'dei' or 'esg'.
+    Returns uploaded metrics as JSON.
+    """
+    db = SessionLocal()
+    try:
+        rows = db.query(Metric).filter(Metric.source == metric_type).order_by(Metric.date).all()
+        result = []
+        for r in rows:
+            result.append({
+                "id": r.id,
+                "source": r.source,
+                "date": r.date.isoformat() if r.date else None,
+                "org_unit": r.org_unit,
+                "metric_name": r.metric_name,
+                "value": float(r.value),
+                "unit": r.unit,
+            })
+        return result
+    finally:
+        db.close()
+
+@app.get('/metrics/esg/analytics', tags=["Metrics"])
+async def esg_analytics(
+    start_date: str = Query(None, description="Start date in YYYY-MM-DD format"),
+    end_date: str = Query(None, description="End date in YYYY-MM-DD format")
+):
+    """
+    Analytics for ESG metrics from the database (uploaded data).
+    """
+    import numpy as np
+    from datetime import datetime as dt_cls
+    import calendar
+
+    db = SessionLocal()
+    try:
+        query = db.query(Metric).filter(Metric.source == 'esg')
+        if start_date:
+            query = query.filter(Metric.date >= datetime.date.fromisoformat(start_date))
+        if end_date:
+            query = query.filter(Metric.date <= datetime.date.fromisoformat(end_date))
+        rows = query.order_by(Metric.date).all()
+    finally:
+        db.close()
+
+    if not rows:
+        return {
+            'avg_daily': None, 'max': None, 'min': None,
+            'weekly_trend': [], 'weekly_pct_change': [],
+            'monthly_accumulated': [], 'predicted': [],
+        }
+
+    # Build a DataFrame from DB rows
+    data = [{"date": r.date, "value": float(r.value)} for r in rows]
+    df = pd.DataFrame(data)
+    df['date'] = pd.to_datetime(df['date'])
+
+    # Promedio diario
+    avg_daily = df['value'].mean() if not df.empty else None
+
+    # Máximo y mínimo
+    max_value = df['value'].max() if not df.empty else None
+    min_value = df['value'].min() if not df.empty else None
+
+    # Agrupar por semana (ISO week)
+    if not df.empty:
+        df['week'] = df['date'].dt.isocalendar().week
+        df['year'] = df['date'].dt.isocalendar().year
+        weekly = df.groupby(['year', 'week'])['value'].sum().reset_index()
+        weekly = weekly.sort_values(['year', 'week'])
+    else:
+        weekly = pd.DataFrame(columns=['year', 'week', 'value'])
+
+    # Tendencia semana a semana
+    if not weekly.empty:
+        weekly['trend'] = weekly['value'].diff().apply(lambda x: 'up' if x > 0 else ('down' if x < 0 else 'same'))
+        trend = weekly[['year', 'week', 'trend']].to_dict(orient='records')
+        # Reducción porcentual entre semanas consecutivas
+        weekly['pct_change'] = weekly['value'].pct_change().apply(lambda x: round(x*100,2) if pd.notnull(x) else None)
+        pct_changes = weekly[['year', 'week', 'pct_change']].to_dict(orient='records')
+    else:
+        trend = []
+        pct_changes = []
+
+    # Acumulado mensual
+    if not df.empty:
+        df['month'] = df['date'].dt.month
+        df['year'] = df['date'].dt.year
+        monthly = df.groupby(['year', 'month'])['value'].sum().reset_index()
+        monthly['month_name'] = monthly['month'].apply(lambda m: calendar.month_name[m])
+        monthly_acc = monthly[['year', 'month', 'month_name', 'value']].to_dict(orient='records')
+    else:
+        monthly_acc = []
+
+    # Convert all values to native Python types for JSON serialization
+    def to_native(val):
+        if pd.isnull(val):
+            return None
+        if isinstance(val, (np.generic, np.int64, np.float64)):
+            return val.item()
+        return val
+
+    avg_daily = to_native(avg_daily)
+    max_value = to_native(max_value)
+    min_value = to_native(min_value)
+    trend = [
+        {k: to_native(v) for k, v in rec.items()} for rec in trend
+    ]
+    pct_changes = [
+        {k: to_native(v) for k, v in rec.items()} for rec in pct_changes
+    ]
+    monthly_acc = [
+        {k: to_native(v) for k, v in rec.items()} for rec in monthly_acc
+    ]
+
+    # === Forecasting: Linear Regression for next 7 days ===
+    predicted = []
+    try:
+        from sklearn.linear_model import LinearRegression
+        if not df.empty:
+            # Prepare data for regression: use date as ordinal for X
+            df_sorted = df.sort_values('date')
+            X = df_sorted['date'].map(pd.Timestamp.toordinal).values.reshape(-1, 1)
+            y = df_sorted['value'].values
+            model = LinearRegression()
+            model.fit(X, y)
+            # Predict next 7 days
+            last_date = df_sorted['date'].max()
+            next_days = [last_date + pd.Timedelta(days=i) for i in range(1, 8)]
+            X_pred = [d.toordinal() for d in next_days]
+            y_pred = model.predict(np.array(X_pred).reshape(-1, 1))
+            predicted = [
+                {'date': d.strftime('%Y-%m-%d'), 'predicted_value': float(round(v, 2))}
+                for d, v in zip(next_days, y_pred)
+            ]
+    except Exception as e:
+        predicted = []  # If forecasting fails, return empty
+
+    return {
+        'avg_daily': avg_daily,
+        'max': max_value,
+        'min': min_value,
+        'weekly_trend': trend,
+        'weekly_pct_change': pct_changes,
+        'monthly_accumulated': monthly_acc,
+        'predicted': predicted
+    }
+
+
+# ============ STATUS ENDPOINTS ============
+
+@app.get('/latest', tags=["Status"], response_model=LatestResponse)
+async def latest():
+    """Get timestamp of last generated brief"""
+    db = SessionLocal()
+    try:
+        b = db.query(Brief).order_by(Brief.created_at.desc()).first()
+        return {"last_brief_generated": b.created_at if b else None}
+    finally:
+        db.close()
+
+@app.get('/health', tags=["Status"])
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "version": "2.0.0",
+        "features": {
+            "deterministic_briefs": True,
+            "ai_briefs": True,
+            "chat": True,
+            "rag": True,
+            "anomaly_detection": True
+        }
+    }
+
+@app.get('/stats', tags=["Status"], response_model=StatsResponse)
+async def get_stats():
+    """Get dashboard statistics"""
+    db = SessionLocal()
+    try:
+        esg_count = db.query(Metric).filter(Metric.source == 'esg').count()
+        dei_count = db.query(Metric).filter(Metric.source == 'dei').count()
+        init_count = db.query(Initiative).count()
+        
+        # Count overdue initiatives
+        today = datetime.date.today()
+        overdue = db.query(Initiative).filter(
+            Initiative.due_date < today.isoformat(),
+            Initiative.status.notin_(['Completed', 'Done', 'Closed'])
+        ).count()
+        
+        return StatsResponse(
+            esg_metrics=esg_count,
+            dei_metrics=dei_count,
+            initiatives=init_count,
+            overdue_count=overdue
+        )
+    finally:
+        db.close()
+
+@app.get('/latest', tags=["Status"])
+async def latest():
+    """Get the timestamp of the last generated brief"""
+    db = SessionLocal()
+    try:
+        b = db.query(Brief).order_by(Brief.created_at.desc()).first()
+        return {"last_brief_generated": b.created_at if b else None}
+    finally:
+        db.close()
